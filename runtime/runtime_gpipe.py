@@ -14,11 +14,51 @@ TRANSLATION = "translation"
 SPEECH_TO_TEXT = "speech_to_text"
 
 
+## START_MAPAEAN
+
+import math
+from typing import Iterable, Union, Literal, Any, Optional
+from dataclasses import dataclass
+
+import torch.nn as nn
+import torch.utils.data
+
+Shape = tuple[int]
+ModelType = tuple[nn.Module, list[str], list[str]]
+
+def override(method):
+    return method
+
+def mapaean_original(method):
+    return method
+
+
+def get_cuda_devices() -> list[torch.device]:
+    total_device_num = torch.cuda.device_count()
+    return [torch.device(i) for i in range(total_device_num)]
+
+def _forward_worker(rank: int, modules: nn.Sequential, microbatch: torch.Tensor):
+    pass
+
+@dataclass
+class ConfigMaps:
+    module_to_stage_map: list[int]
+    stage_to_rank_map: dict[int, list[int]]
+    stage_to_depth_map: Optional[dict[int, int]]
+    
+    def __post_init__(self):
+        self.stage_to_depth_map = {
+            int(k): v for (k, v) in self.stage_to_depth_map.items()
+        }
+
+
 class ModulesWithDependencies:
-    def __init__(self, modules_with_dependencies):
-        self._modules = []
-        self._all_input_names = []
-        self._all_output_names = []
+    """자기 stage의 module들만 모아 놓음.
+    """
+    def __init__(self, modules_with_dependencies: list[ModelType]):
+        self._modules: list[nn.Module] = []
+        self._all_input_names: list[list[str]] = []
+        self._all_output_names: list[list[str]] = []
         for (module, input_names, output_names) in modules_with_dependencies:
             self._modules.append(module)
             self._all_input_names.append(input_names)
@@ -39,140 +79,40 @@ class ModulesWithDependencies:
                 return True
         return False
 
-
-## START_MAPAEAN
-
-import math
-from typing import Iterable, Union, Literal, Any
-import torch.nn as nn
-import torch.utils.data
-
-Shape = tuple[int]
-
-def override(method):
-    return method
-
-def get_cuda_devices() -> list[torch.device]:
-    total_device_num = torch.cuda.device_count()
-    return [torch.device(i) for i in range(total_device_num)]
-
-def _forward_worker(rank: int, modules: nn.Sequential, microbatch: torch.Tensor):
-    pass
-
 # class MapaeanGPipe(nn.Module):
 class MapaeanGPipe():
     """GPipe module by Mapae."""
     @override
     def __init__(self,
-        model: list[tuple[nn.Module, list[str], list[str]]],
+        model: list[ModelType],
+        # ex) [
+        #       (Stage0(), ["input0"], ["out0"]),
+        #       (Stage1(), ["out0"], ["out1"]),
+        #       (criterion, ["out1"], ["loss"])
+        #     ]
         *,
         distributed_backend: Literal['gloo', 'nccl'],
-        fp16: bool,
+        fp16: bool,  # 이건 안 쓸 것.
         loss_scale: float = 1,
         training_tensor_shapes: dict[str, Shape],
         eval_tensor_shapes: dict[str, Shape],
         training_tensor_dtypes: dict[str, torch.dtype],
-        inputs_module_destinations = {"input": 0}.copy(),
-        target_tensor_names = {"targets"}.copy(),
+        inputs_module_destinations: dict[str, int],  # ex) {"input": 0}
+        target_tensor_names: set[str],  # ex) {"targets"}
         configuration_maps: dict[Literal['module_to_stage_map', 'stage_to_rank_map', 'stage_to_depth_map'], Any],
-        master_addr: str,  # '127.0.0.1' 등
+        master_addr: str,  # ex) '127.0.0.1'
         rank: int,
         local_rank: int,
         num_ranks_in_server: int,
         verbose_freq: int = 0,
-        model_type: str,  # "IMAGE_CLASSIFICATION" 등
+        model_type: str,  # ex) "IMAGE_CLASSIFICATION"
         enable_recompute: bool = False
     ):
-        """
-        모델의 구조는 다음과 같이 생겼다:
-        [
-            (Stage0(), ["input0"], ["out0"]),
-            (Stage1(), ["out0"], ["out1"]),
-            (criterion, ["out1"], ["loss"])
-        ]
-        """
-        self.tensors = []
-        self.gradients = {}
-        self.send_ranks = {}
-        self.receive_ranks = {}
-
-        self.rank = rank
-        self.local_rank = local_rank
-        self.stage = None
-        self.tensor_tags = {}
-        self.forward_minibatch_id = 0
-        self.backward_minibatch_id = 0
-        self.criterion_input_name = str(model[-1][1][0])
-        self.distributed_backend = distributed_backend
-        self.fp16 = fp16
-        self.loss_scale = loss_scale
-        self.training_tensor_shapes = training_tensor_shapes
-        self.eval_tensor_shapes = eval_tensor_shapes
-        self.training_tensor_dtypes = training_tensor_dtypes
-        self.model_type = model_type
-        self.target_tensor_names = target_tensor_names
-        
-
-    def __len__(self) -> int:
-        pass
-
-    def __getitem__(self, index: int) -> nn.Module:
-        pass
-
-    def forward_once(self, x: torch.Tensor) -> torch.Tensor:
-        """Run forward process one time.
-
-        Args:
-            x (torch.Tensor): minibatch_size * (input_tensor_shape)
-
-        Returns:
-            torch.Tensor: minibatch_size * (output_tensor_shape)
-        """
-        assert x.shape[0] % self.microbatches == 0
-
-        # F(rank, 0)이 끝나면 rank+1 디바이스에 output을 전달한 뒤 곧바로 F(rank, 1)을 시작한다.
-        # 이런 식으로 F(rank, ubatch_num)까지 돌리면 rank+1 디바이스에서 역전파가 올 때까지 기다린다.
-
-
-
-    def backward_once(self):
-        pass
-
-    def run(self, dataset: torch.utils.data.Dataset, batch_size: int, no_grad: bool = False):
-        assert batch_size % self.microbatches == 0
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size = batch_size // self.microbatches,
-            shuffle=True,
-            # pin_memory=True,
-            # sampler=
-        )
-        microbatch_count = 0
-        for (inputs, labels) in loader:
-            device = self._devices[microbatch_count]
-            inputs: torch.Tensor = inputs.to(device)
-            labels: torch.Tensor = labels.to(device)
-
-            microbatch_count = (microbatch_count + 1) % self.microbatches
-
-    # __call__ = 
-    
-
-
-## END_MAPAEAN
-
-class StageRuntime:
-    def __init__(self,model, distributed_backend, fp16, loss_scale,
-                 training_tensor_shapes, eval_tensor_shapes,
-                 training_tensor_dtypes, inputs_module_destinations,
-                 target_tensor_names, configuration_maps, master_addr,
-                 rank, local_rank, num_ranks_in_server, verbose_freq,
-                 model_type, enable_recompute=False):
-        # Metadata needed for forward and backward pass within this stage.
+        # 이 stage의 forward와 backward에서 필요한 메타데이터들을 정의한다.
         self.tensors = []
         self.gradients = {}
         self.distributed_backend = distributed_backend
-        self.fp16 = fp16
+        self.fp16 = False  # 여기서는 사용하지 않음
         self.loss_scale = loss_scale
         self.training_tensor_shapes = training_tensor_shapes
         self.eval_tensor_shapes = eval_tensor_shapes
@@ -180,7 +120,10 @@ class StageRuntime:
         self.model_type = model_type
         self.target_tensor_names = target_tensor_names
 
-        self.initialize(model, inputs_module_destinations, configuration_maps,
+        # GPipe용
+        self.tensor_stack: list[dict[str, torch.Tensor]] = []
+
+        self.initialize(model, inputs_module_destinations, ConfigMaps(**configuration_maps),
                         master_addr, rank, local_rank, num_ranks_in_server)
 
         self.verbose_freq = verbose_freq
@@ -197,19 +140,40 @@ class StageRuntime:
         if rank == num_ranks_in_server - 1:
             self.enable_recompute = False
 
-    def initialize(self, model, inputs_module_destinations,
-                   configuration_maps, master_addr, rank,
-                   local_rank, num_ranks_in_server):
-        self.send_ranks = {}
-        self.receive_ranks = {}
+    def initialize(self,
+        model: list[ModelType],
+        inputs_module_destinations: dict[str, int],
+        cfg: ConfigMaps,
+        master_addr: str,
+        rank: int,
+        local_rank: int,
+        num_ranks_in_server: int
+    ):
+        """서로 다른 rank 사이의 모듈들
+
+        Args:
+            model (ModelType): 돌리고자 하는 전체 모델.
+            inputs_module_destinations (dict[str, int]): ???
+            configuration_maps (ConfigMaps): 각 모듈, stage, rank, depth 간 관계를 정의한다.
+                - module_to_stage_map (list[int]): 각 모듈(Stage0, Stage1, criterion 등)이 어떤 stage로 배치될지를 결정.
+                - stage_to_rank_map (dict[int, int]): 각 stage가 어떤 machine에 배치될지를 결정.
+                - stage_to_depth_map (dict[int, int]): 각 stage가 
+            master_addr (str): 컴퓨터 address
+            rank (int): 현재 GPU의 rank.
+            local_rank (int): 현재 GPU의 local rank.
+            num_ranks_in_server (int): 한 server에 몇 개의 rank가 있는지?
+        """
+        self.send_ranks: dict[str, list[int]] = {}
+        self.receive_ranks: dict[str, list[int]] = {}
         self.rank = rank
         self.local_rank = local_rank
         self.stage = None
-        self.tensor_tags = {}
+        self.tensor_tags: dict[str, int] = {}
         self.forward_minibatch_id = 0
         self.backward_minibatch_id = 0
         self.criterion_input_name = str(model[-1][1][0])
 
+        # model 간 전달하는 각 tensor에 대해, 고유한 tensor_tag 번호를 붙여준다.
         tensor_tag = 1
         for (_, input_tensors, output_tensors) in model:
             for input_tensor in input_tensors:
@@ -220,19 +184,15 @@ class StageRuntime:
                 if output_tensor not in self.tensor_tags:
                     self.tensor_tags[output_tensor] = tensor_tag
                     tensor_tag += 1
-        for target_tensor_name in sorted(self.target_tensor_names):
+        for target_tensor_name in sorted(self.target_tensor_names):  # {"targets"}
             self.tensor_tags[target_tensor_name] = tensor_tag
             tensor_tag += 1
         self.tensor_tags["ack"] = tensor_tag
         tensor_tag += 1
 
-        module_to_stage_map = configuration_maps['module_to_stage_map']
-        stage_to_rank_map = configuration_maps['stage_to_rank_map']
-        stage_to_depth_map = configuration_maps['stage_to_depth_map']
-
-        if module_to_stage_map is None:
-            # If IP addresses not specified, resort to all layers on
-            # single machine.
+        if cfg.module_to_stage_map is None:
+            # 각 stage의 IP 주소가 특정되지 않으면, 모든 stage를 single machine에 배치한다.
+            # 물론 이는 우리가 원하는 건 아니다.
             assert self.rank is None
             self.modules_with_dependencies = ModulesWithDependencies(model)
             self.is_criterion = True
@@ -246,113 +206,101 @@ class StageRuntime:
             self.num_warmup_minibatches = 0
             self.comm_handler = None
         else:
-            assert len(module_to_stage_map) == len(model)
+            # GPipe에서 중요한 건 사실 module_to_stage_map 하나뿐이다.
+            assert len(cfg.module_to_stage_map) == len(model)
             assert self.rank is not None
 
-            stage_to_module_map = collections.defaultdict(list)
-            for module in range(len(module_to_stage_map)):
-                stage_to_module_map[module_to_stage_map[module]].append(module)
+            # 각 stage에 어떤 module을 배치할지 정한다.
+            stage_to_module_map: dict[int, list[int]] = collections.defaultdict(list)  # ex) {0: [0], 1: [1, 2]}
+            for module in range(len(cfg.module_to_stage_map)):
+                stage_to_module_map[cfg.module_to_stage_map[module]].append(module)
 
-            rank_to_stage_map = {}
-            for stage in stage_to_rank_map:
-                for rank in stage_to_rank_map[stage]:
+            rank_to_stage_map: dict[int, int] = {}  # ex) {0: 0, 1: 0, 2: 0, 3: 1}
+            for stage in cfg.stage_to_rank_map:
+                for rank in cfg.stage_to_rank_map[stage]:
                     rank_to_stage_map[rank] = stage
 
-            # Now, use this mapping to determine the modules contained in
-            # each stage.
+            # 여기서 중요한 건 stage, ranks_in_prev_stage, ranks_in_next_stage, modules_with_dependencies, is_criterion 이다.
+            # rank_in_stage는 쓰지 않는다. GPipe이므로 data parallelism은 중요치 않음.
             assert 0 <= self.rank < len(rank_to_stage_map)
             self.num_ranks = len(rank_to_stage_map)
             self.num_stages = len(stage_to_module_map)
             self.stage = rank_to_stage_map[self.rank]
-            self.rank_in_stage = stage_to_rank_map[self.stage].index(self.rank)
-            self.num_ranks_in_stage = len(stage_to_rank_map[self.stage])
-            self.num_ranks_in_first_stage = len(stage_to_rank_map[0])
+            self.rank_in_stage = cfg.stage_to_rank_map[self.stage].index(self.rank)
+            self.num_ranks_in_stage = len(cfg.stage_to_rank_map[self.stage])
+            self.num_ranks_in_first_stage = len(cfg.stage_to_rank_map[0])
             self.num_ranks_in_previous_stage = 0
             self.ranks_in_previous_stage = []
             if self.stage > 0:
-                self.num_ranks_in_previous_stage = len(
-                    stage_to_rank_map[self.stage - 1])
-                self.ranks_in_previous_stage = stage_to_rank_map[self.stage - 1]
+                self.num_ranks_in_previous_stage = len(cfg.stage_to_rank_map[self.stage - 1])
+                self.ranks_in_previous_stage = cfg.stage_to_rank_map[self.stage - 1]
             self.num_ranks_in_next_stage = 0
             self.ranks_in_next_stage = []
             if self.stage < self.num_stages - 1:
-                self.num_ranks_in_next_stage = len(
-                    stage_to_rank_map[self.stage + 1])
-                self.ranks_in_next_stage = stage_to_rank_map[self.stage + 1]
+                self.num_ranks_in_next_stage = len(cfg.stage_to_rank_map[self.stage + 1])
+                self.ranks_in_next_stage = cfg.stage_to_rank_map[self.stage + 1]
             modules = stage_to_module_map[self.stage]
-            self.modules_with_dependencies = ModulesWithDependencies(
-                [model[module] for module in modules])
+            self.modules_with_dependencies = ModulesWithDependencies([model[module] for module in modules])  # 자기 stage의 module들을 모아놓았다.
             self.is_criterion = self.stage == (self.num_stages - 1)
-            if stage_to_depth_map is not None:
-                self.num_warmup_minibatches = stage_to_depth_map[
-                    str(self.stage)]
+            if cfg.stage_to_depth_map is not None:
+                self.num_warmup_minibatches = cfg.stage_to_depth_map[str(self.stage)]
             else:
                 self.num_warmup_minibatches = self.num_ranks - 1
                 for i in range(self.stage):
-                    self.num_warmup_minibatches -= len(
-                        stage_to_rank_map[i])
-                self.num_warmup_minibatches = self.num_warmup_minibatches // \
-                    self.num_ranks_in_stage
+                    self.num_warmup_minibatches -= len(cfg.stage_to_rank_map[i])
+                self.num_warmup_minibatches = self.num_warmup_minibatches // self.num_ranks_in_stage
 
-            # To determine where tensors should be sent and received, first
-            # determine the "producing" and "consuming" module IDs of each
-            # tensor. We then use the corresponding machine ranks to send
-            # and receive tensors.
-            master_port = 12345
+            # tensor를 어디로 주고받을지를 정하기 위해, 먼저 각 텐서를 만들거나 사용하는 모듈의 ID를 정한다.
+            # 그리고 해당 rank를 이용해 실제로 주고받는다.
             self.comm_handler = communication.CommunicationHandler(
                 master_addr=master_addr,
-                master_port=master_port,
+                master_port=12345,  # magic number?
                 rank=self.rank,
                 local_rank=self.local_rank,
                 num_ranks_in_server=num_ranks_in_server,
                 world_size=self.num_ranks,
                 fp16=self.fp16,
-                backend=self.distributed_backend)
+                backend=self.distributed_backend
+            )
 
+            # receive_ranks와 send_ranks를 결정한다.
             for i in range(len(model)):
                 for j in range(i+1, len(model)):
                     for tensor_name in model[i][2]:
                         if tensor_name in model[j][1]:
-                            if module_to_stage_map[i] == \
-                                module_to_stage_map[j]:
+                            if cfg.module_to_stage_map[i] == cfg.module_to_stage_map[j]:
                                 continue
-                            # For now, assume that each stage is served by only
-                            # a single machine.
-                            if module_to_stage_map[j] == self.stage:
-                                self.receive_ranks[tensor_name] = \
-                                    stage_to_rank_map[module_to_stage_map[i]]
-                            if module_to_stage_map[i] == self.stage:
-                                self.send_ranks[tensor_name] = \
-                                    stage_to_rank_map[module_to_stage_map[j]]
+                            # For now, assume that each stage is served by only a single machine.
+                            if cfg.module_to_stage_map[j] == self.stage:
+                                self.receive_ranks[tensor_name] = cfg.stage_to_rank_map[cfg.module_to_stage_map[i]]
+                            if cfg.module_to_stage_map[i] == self.stage:
+                                self.send_ranks[tensor_name] = cfg.stage_to_rank_map[cfg.module_to_stage_map[j]]
 
-            for model_inputs in inputs_module_destinations.keys():
-                destination_stage = module_to_stage_map[
-                    inputs_module_destinations[model_inputs]]
-                if destination_stage > self.stage:
-                    self.send_ranks[model_inputs] = \
-                        self.ranks_in_next_stage
+            for model_inputs in inputs_module_destinations.keys():  # {"input": 0}
+                destination_stage = cfg.module_to_stage_map[inputs_module_destinations[model_inputs]]
+                # destination_stage는 목적지라는 뜻인 듯.
+                if self.stage < destination_stage:
+                    self.send_ranks[model_inputs] = self.ranks_in_next_stage
 
                 if 0 < self.stage <= destination_stage:
-                    self.receive_ranks[model_inputs] = \
-                        self.ranks_in_previous_stage
+                    self.receive_ranks[model_inputs] = self.ranks_in_previous_stage
 
                 if destination_stage > 0:
                     if model_inputs not in self.tensor_tags:
                         self.tensor_tags[model_inputs] = tensor_tag
                         tensor_tag += 1
 
+        # 모든 모듈들을 cuda로 보낸다.
         modules = self.modules_with_dependencies.modules()
         for i in range(len(modules)):
             modules[i] = modules[i].cuda()
-            if self.fp16:
-                import apex.fp16_utils as fp16_utils
-                modules[i] = fp16_utils.BN_convert_float(modules[i].half())
 
         # Initialize all groups in the same order on every worker.
-        if stage_to_rank_map is not None:
+        # 아마 GPipe에서는 항상 len(ranks) == 1 이므로 group=None으로 고정될 것.
+        if cfg.stage_to_rank_map is not None:
             groups = []
             for stage in range(self.num_stages):
-                ranks = stage_to_rank_map[stage]
+                ranks = cfg.stage_to_rank_map[stage]
                 if len(ranks) > 1:
                     groups.append(dist.new_group(ranks=ranks))
                 else:
@@ -367,10 +315,9 @@ class StageRuntime:
         # class to wrap these dependencies, and use run_forward and
         # run_backward methods downstream.
         num_parameters = 0
-        for i in range(len(modules)):
-            if group is not None:
-                if ((i < (len(modules)-1) and self.is_criterion)
-                    or not self.is_criterion):
+        if group is not None:
+            for i in range(len(modules)):
+                if ((i < (len(modules)-1) and self.is_criterion) or not self.is_criterion):
                     num_parameters += \
                         sum(x.size()[0] * x.size()[1]
                             if len(x.size()) > 1 else x.size()[0]
@@ -378,25 +325,16 @@ class StageRuntime:
                     modules[i] = torch.nn.parallel.DistributedDataParallel(
                         modules[i],
                         process_group=group,
-                        device_ids=[local_rank],
-                        output_device=local_rank)
+                        device_ids=[self.local_rank],
+                        output_device=self.local_rank
+                    )
         if self.num_ranks_in_stage > 1:
             module_size = 4. * num_parameters
             print("Replicating stage: ranks=%d, module_size=%.3f" % (
                 self.num_ranks_in_stage, module_size))
 
-        if self.fp16:
-            self.master_parameters = []
-            self.model_parameters = []
-            for i in range(len(modules)):
-                import apex.fp16_utils as fp16_utils
-                module_parameters, module_master_parameters = \
-                    fp16_utils.prep_param_lists(modules[i])
-                self.master_parameters.extend(module_master_parameters)
-                self.model_parameters.extend(module_parameters)
-        else:
-            self.master_parameters = list(self.parameters())
-            self.model_parameters = None
+        self.master_parameters = list(self.parameters())
+        self.model_parameters = None
 
         if self.comm_handler is not None:
             self.comm_handler.initialize(
@@ -408,7 +346,8 @@ class StageRuntime:
                 self.rank_in_stage,
                 self.num_ranks_in_stage,
                 self.ranks_in_previous_stage,
-                self.ranks_in_next_stage)
+                self.ranks_in_next_stage
+            )
 
     @property
     def target(self):
@@ -427,25 +366,22 @@ class StageRuntime:
         state_dict = collections.OrderedDict()
         for i, module in enumerate(self.modules_with_dependencies.modules()):
             state_dict["module%d" % i] = module.state_dict()
-        if self.fp16:
-            state_dict["master_parameters"] = self.master_parameters
         return state_dict
 
     def load_state_dict(self, state_dict):
         for i, module in enumerate(self.modules_with_dependencies.modules()):
             module.load_state_dict(state_dict["module%d" % i])
-        if self.fp16:
-            saved_master_parameters = state_dict["master_parameters"]
-            for master_parameter, saved_master_parameter in zip(
-                self.master_parameters, saved_master_parameters):
-                master_parameter.data.copy_(saved_master_parameter.data)
 
     def cuda(self):
+        """모든 모듈들을 cuda로 보낸다.
+        """
         modules = self.modules_with_dependencies.modules()
         for i in range(len(modules)):
             modules[i] = modules[i].cuda()
 
     def zero_grad(self):
+        """모든 모듈에 대해 zero_grad를 적용한다.
+        """
         modules = self.modules_with_dependencies.modules()
         for i in range(len(modules)):
             modules[i].zero_grad()
@@ -514,8 +450,6 @@ class StageRuntime:
                                  dtype=torch.int).cuda()
             elif self.model_type == IMAGE_CLASSIFICATION:
                 (input, target) = input
-                if self.fp16:
-                    input = input.half()
                 self.tensors[-1]["input0"] = input.cuda(non_blocking=True)
                 self.tensors[-1]["target"] = target.cuda(non_blocking=True)
             elif self.model_type == SPEECH_TO_TEXT:
@@ -605,6 +539,24 @@ class StageRuntime:
             self.comm_handler.increment_messaging_index(
                 sending=True)
 
+    @mapaean_original
+    def run_forward_4times(self):
+        # 만약 마지막 stage라면 stack을 이용해 뒤부터 pop해야 하므로, tensors를 백업해 놓는다.
+        if self.is_criterion:
+            self.tensor_stack.clear()  # 실제로는 불필요
+            self.run_forward()
+            self.tensor_stack.append(self.tensors)
+            self.run_forward()
+            self.tensor_stack.append(self.tensors)
+            self.run_forward()
+            self.tensor_stack.append(self.tensors)
+            self.run_forward()
+        else:
+            self.run_forward()
+            self.run_forward()
+            self.run_forward()
+            self.run_forward()
+
     def run_forward(self, recompute_step=False):
         """Run forward pass.
         """
@@ -655,6 +607,7 @@ class StageRuntime:
             for (output_name, module_output) in zip(output_names, module_outputs):
                 tensors[output_name] = module_output
 
+        # 마지막 stage에서만 중요한 부분
         self.output = tensors[input_names[0]]
         if self.is_criterion and self.model_type == TRANSLATION:
             loss_per_batch = tensors[output_names[0]] * tensors[self.criterion_input_name].size(1)
@@ -665,7 +618,24 @@ class StageRuntime:
         else:
             self.loss = 1
 
-    def run_backward(self):
+    @mapaean_original
+    def run_backward_4times(self):
+        # 모든 gradients를 합산한 뒤 optimizer에서 한 번에 step해야 제대로 sync가 이루어진다.
+        if self.is_criterion:
+            self.run_backward(0)
+            self.tensors = self.tensor_stack.pop()
+            self.run_backward(1)
+            self.tensors = self.tensor_stack.pop()
+            self.run_backward(2)
+            self.tensors = self.tensor_stack.pop()
+            self.run_backward(3)
+        else:
+            self.run_backward(0)
+            self.run_backward(1)
+            self.run_backward(2)
+            self.run_backward(3)
+
+    def run_backward(self, microbatch_count: int):
         # Receive input gradients needed for backward pass.
         self.receive_tensors_backward()
         # Backward pass through modules in reverse order.
@@ -724,8 +694,8 @@ class StageRuntime:
 
         # Perform backward pass.
         torch.autograd.backward(tuple([outputs[output_name] for output_name in outputs]),
-                                grad_tensors=tuple([output_gradients[output_name]
-                                                    for output_name in outputs]))
+          grad_tensors=tuple([output_gradients[output_name] for output_name in outputs]),
+          retain_graph=(microbatch_count != 3))  # 마지막 microbatch일 경우 다음 backward를 준비한다.
 
         # Input tensors don't need gradients.
         for input_name in inputs:
